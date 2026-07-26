@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "textinator"
+version = "0.1.0"
+description = "Turn any text into an audiobook, delivered as a private podcast feed."
+requires-python = ">=3.12"
+dependencies = [
+    "edge-tts>=7.0",
+    "mutagen>=1.47",
+    "trafilatura>=2.0",
+    "segno>=1.6",
+    "multipart>=1.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# local/offline TTS; install torch CPU-only first to avoid CUDA wheels:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+kokoro = ["kokoro>=0.9", "soundfile>=0.13"]
+
+[project.scripts]
+textinator = "textinator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,56 @@
+# virtual environments
+.venv/
+venv/
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# generated audio and private feed output
+/feed/
+*.mp3
+*.m4a
+*.m4b
+*.wav
+
+# caches, coverage, and scratch files
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.scratch/
+*.log
+
+# credentials and local environment
+.env
+.env.*
+!.env.example
+xai-auth.json
+xai-auth.json.lock
+*.pem
+*.key
+*.p12
+*.pfx
+
+# machine-local editor and agent settings
+.claude/settings.local.json
+.idea/
+.vscode/
+
+# internal build ledgers (kept locally, not published)
+/PLAN.md
+/STATUS.md
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*~
+*.swp
