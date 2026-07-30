@@ -34,6 +34,7 @@ xclip -o | textinator -
 # pick a voice
 textinator note.txt --voice en-US-AriaNeural
 textinator --list-voices en          # see what's available
+textinator --backend grok --list-voices  # live xAI built-in + custom catalog
 
 # choose where the feed lives and the URL it will be served at
 textinator note.txt --feed-dir ~/feeds/textinator \
@@ -107,7 +108,7 @@ Prefer HTTPS hosting for anything beyond your LAN.
 |----------|-----------|---------------|----------------------------------------|
 | `edge`   | free      | yes           | default; Azure neural voices, unofficial |
 | `kokoro` | free      | no (local)    | offline CPU TTS; `pip install -e '.[kokoro]'` (~330MB model auto-downloads on first use); voices like `af_heart`, `am_adam`, `bf_emma` |
-| `grok`   | subscription / metered | yes | xAI OAuth or `XAI_API_KEY`; voices `eve`, `ara`, `rex`, `sal`, `leo` |
+| `grok`   | subscription / metered | yes | xAI OAuth or `XAI_API_KEY`; built-in and custom voices discovered live |
 
 Guarded backends refuse runs over `--max-chars` (default 50,000) unless you
 pass `--force`. `--dry-run` shows the character count and a short cost label:
@@ -119,6 +120,11 @@ OAuth is the default. Select metered API-key authentication explicitly with
 usage; the CLI asks first, or you can explicitly pass `--api-fallback`. OAuth
 tokens live in Textinator's private data directory and are not shared with or
 read from other applications.
+
+The web UI checks Grok availability for the selected auth mode and loads its
+current voice catalog from xAI. If credentials or connectivity are unavailable,
+Grok is shown as unavailable and cannot be submitted; Edge and Kokoro continue
+to work normally. Textinator does not substitute a stale Grok voice list.
 
 ## Development
 

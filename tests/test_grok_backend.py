@@ -87,6 +87,82 @@ def test_list_custom_voices(monkeypatch):
     assert voices == [{"voice_id": "cvabc123", "name": "Sample Voice"}]
 
 
+def test_list_builtin_voices_uses_live_xai_catalog(monkeypatch):
+    from textinator.backends import grok as grok_mod
+
+    monkeypatch.setenv("XAI_API_KEY", "test-key")
+    captured = {}
+
+    def fake_get(url, key):
+        captured.update(url=url, key=key)
+        return (
+            b'{"voices": ['
+            b'{"voice_id": "orion", "name": "Orion"},'
+            b'{"voice_id": "eve", "name": "Eve"}'
+            b"]}"
+        )
+
+    monkeypatch.setattr(grok_mod, "_get", fake_get)
+    voices = grok_mod.list_builtin_voices("api")
+    assert [voice["voice_id"] for voice in voices] == ["orion", "eve"]
+    assert captured == {
+        "url": "https://api.x.ai/v1/tts/voices",
+        "key": "test-key",
+    }
+
+
+def test_discover_voices_merges_custom_first_without_static_fallback(monkeypatch):
+    from textinator.backends import grok as grok_mod
+
+    monkeypatch.setattr(
+        grok_mod,
+        "list_builtin_voices",
+        lambda *args, **kwargs: [{"voice_id": "orion", "name": "Orion"}],
+    )
+    monkeypatch.setattr(
+        grok_mod,
+        "list_custom_voices",
+        lambda *args, **kwargs: [
+            {"voice_id": "cvabc123", "name": "Sample Voice"},
+            {"voice_id": "orion", "name": "Duplicate"},
+        ],
+    )
+    voices, warning = grok_mod.discover_voices("oauth")
+    assert voices == [
+        {
+            "voice_id": "cvabc123",
+            "name": "Sample Voice",
+            "custom": True,
+        },
+        {
+            "voice_id": "orion",
+            "name": "Duplicate",
+            "custom": True,
+        },
+    ]
+    assert warning is None
+
+
+def test_discover_voices_reports_custom_catalog_failure(monkeypatch):
+    from textinator.backends import grok as grok_mod
+
+    monkeypatch.setattr(
+        grok_mod,
+        "list_builtin_voices",
+        lambda *args, **kwargs: [{"voice_id": "orion", "name": "Orion"}],
+    )
+
+    def fail_custom(*args, **kwargs):
+        raise GrokError("custom endpoint timed out")
+
+    monkeypatch.setattr(grok_mod, "list_custom_voices", fail_custom)
+    voices, warning = grok_mod.discover_voices("oauth")
+    assert voices == [
+        {"voice_id": "orion", "name": "Orion", "custom": False}
+    ]
+    assert warning == "custom voices unavailable: custom endpoint timed out"
+
+
 def test_list_custom_voices_requires_key(monkeypatch):
     from textinator.backends import grok as grok_mod
 

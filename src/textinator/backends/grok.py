@@ -25,7 +25,6 @@ from ..xai_auth import (
 )
 
 API_URL = "https://api.x.ai/v1/tts"
-VOICES = ("ara", "eve", "rex", "sal", "leo")
 _TIMEOUT_SECONDS = 120
 
 
@@ -57,16 +56,13 @@ def _get(url: str, bearer_token: str) -> bytes:
         raise GrokError(f"could not reach xAI API: {exc}") from exc
 
 
-def list_custom_voices(
+def _authenticated_get(
+    path: str,
     auth_mode: str | None = None,
     *,
     allow_api_fallback: bool = False,
-) -> list[dict]:
-    """The team's cloned voices: [{"voice_id": ..., "name": ...}, ...].
-
-    Raises GrokError without credentials or on network trouble; callers that
-    only want decoration should catch and move on.
-    """
+) -> bytes:
+    """GET an xAI API path, refreshing OAuth once on authorization failure."""
     try:
         credential = resolve_credentials(
             auth_mode, allow_api_fallback=allow_api_fallback
@@ -74,10 +70,7 @@ def list_custom_voices(
     except XAIAuthError as exc:
         raise GrokError(str(exc)) from exc
     try:
-        raw = _get(
-            f"{credential.base_url}/custom-voices",
-            credential.token,
-        )
+        return _get(f"{credential.base_url}/{path.lstrip('/')}", credential.token)
     except GrokHTTPError as exc:
         if credential.source != "oauth" or exc.status_code not in {401, 403}:
             raise
@@ -92,12 +85,97 @@ def list_custom_voices(
                 )
         except XAIAuthError as auth_exc:
             raise GrokError(str(auth_exc)) from auth_exc
-        raw = _get(f"{credential.base_url}/custom-voices", credential.token)
+        return _get(f"{credential.base_url}/{path.lstrip('/')}", credential.token)
+
+
+def _voice_list(raw: bytes, source: str) -> list[dict]:
+    """Decode and minimally validate an xAI voice-list response."""
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise GrokError("xAI custom-voices response was not valid JSON") from exc
-    return payload.get("voices", [])
+        raise GrokError(f"xAI {source} response was not valid JSON") from exc
+    voices = payload.get("voices") if isinstance(payload, dict) else None
+    if not isinstance(voices, list):
+        raise GrokError(f"xAI {source} response did not contain a voice list")
+    return [
+        voice
+        for voice in voices
+        if isinstance(voice, dict) and str(voice.get("voice_id") or "").strip()
+    ]
+
+
+def list_builtin_voices(
+    auth_mode: str | None = None,
+    *,
+    allow_api_fallback: bool = False,
+) -> list[dict]:
+    """Return the current built-in TTS voices reported by xAI."""
+    raw = _authenticated_get(
+        "tts/voices",
+        auth_mode,
+        allow_api_fallback=allow_api_fallback,
+    )
+    voices = _voice_list(raw, "built-in voices")
+    if not voices:
+        raise GrokError("xAI returned no built-in TTS voices")
+    return voices
+
+
+def list_custom_voices(
+    auth_mode: str | None = None,
+    *,
+    allow_api_fallback: bool = False,
+) -> list[dict]:
+    """Return the team's cloned voices reported by xAI."""
+    raw = _authenticated_get(
+        "custom-voices",
+        auth_mode,
+        allow_api_fallback=allow_api_fallback,
+    )
+    return _voice_list(raw, "custom voices")
+
+
+def discover_voices(
+    auth_mode: str | None = None,
+    *,
+    allow_api_fallback: bool = False,
+) -> tuple[list[dict], str | None]:
+    """Return the live built-in/custom catalog and an optional custom warning.
+
+    Built-in discovery is the availability check and must succeed. Custom
+    discovery is additive: if that endpoint alone fails, built-in TTS remains
+    usable and the failure is returned as a visible warning.
+    """
+    builtins = list_builtin_voices(
+        auth_mode,
+        allow_api_fallback=allow_api_fallback,
+    )
+    warning = None
+    try:
+        custom = list_custom_voices(
+            auth_mode,
+            allow_api_fallback=allow_api_fallback,
+        )
+    except GrokError as exc:
+        custom = []
+        warning = f"custom voices unavailable: {exc}"
+
+    combined = [
+        {**voice, "custom": True}
+        for voice in custom
+    ] + [
+        {**voice, "custom": False}
+        for voice in builtins
+    ]
+    seen: set[str] = set()
+    voices = []
+    for voice in combined:
+        voice_id = str(voice["voice_id"]).strip()
+        if voice_id in seen:
+            continue
+        seen.add(voice_id)
+        voices.append({**voice, "voice_id": voice_id})
+    return voices, warning
 
 
 def _post(url: str, payload: dict, bearer_token: str) -> bytes:

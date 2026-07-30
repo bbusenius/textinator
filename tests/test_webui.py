@@ -161,42 +161,111 @@ def test_voice_hints_follow_backend(server):
     hints = json.loads(re.search(r"var HINTS = (\{.*?\});", page).group(1))
     assert hints["edge"]["default"] == "en-US-GuyNeural"
     assert {"id": "af_heart", "label": "af_heart"} in hints["kokoro"]["voices"]
-    assert [v["id"] for v in hints["grok"]["voices"]] == [
-        "ara", "eve", "rex", "sal", "leo",
-    ]
-    # the datalist + updater are wired in
+    assert hints["grok"] == {"default": "eve", "voices": []}
+    # Grok is live-discovered rather than backed by a static catalog.
     assert '<datalist id="voice-options">' in page
     assert "updateVoiceHints" in page
+    assert "fetch('/grok/voices?auth='" in page
+    assert "voiceInput.disabled = true" in page
+    assert "makeButton.disabled = true" in page
+    assert 'id="grok-status"' in page
+    assert 'id="retry-grok"' in page
 
 
-def test_grok_custom_voices_merged_with_names(monkeypatch, tmp_path):
-    from textinator.webui import build_voice_hints
+def test_grok_live_voices_merged_with_names(monkeypatch):
+    from textinator.webui import grok_voice_status
 
     monkeypatch.setattr(
-        "textinator.backends.grok.list_custom_voices",
-        lambda: [{"voice_id": "cvtestid1234", "name": "Sample Voice"}],
+        "textinator.backends.grok.discover_voices",
+        lambda auth_mode: (
+            [
+                {
+                    "voice_id": "cvtestid1234",
+                    "name": "Sample Voice",
+                    "custom": True,
+                },
+                {"voice_id": "orion", "name": "Orion", "custom": False},
+            ],
+            None,
+        ),
     )
-    hints = build_voice_hints(include_grok_custom=True)
-    # cloned voice first, displayed by name, submitting the id
-    assert hints["grok"]["voices"][0] == {
+    status = grok_voice_status("oauth")
+    assert status["available"] is True
+    assert status["voices"][0] == {
         "id": "cvtestid1234", "label": "Sample Voice (custom)",
     }
-    # built-ins still present
-    assert {"id": "eve", "label": "eve"} in hints["grok"]["voices"]
+    assert status["voices"][1] == {"id": "orion", "label": "Orion"}
+    assert status["detail"] == "Grok available · 2 voices"
 
 
-def test_grok_custom_voices_failure_is_silent(monkeypatch):
+def test_grok_unavailable_is_explicit(monkeypatch):
     from textinator.backends.grok import GrokError
-    from textinator.webui import build_voice_hints
+    from textinator.webui import grok_voice_status
 
-    def boom():
-        raise GrokError("no key")
+    def boom(auth_mode):
+        raise GrokError("xAI OAuth is not configured")
 
-    monkeypatch.setattr("textinator.backends.grok.list_custom_voices", boom)
-    hints = build_voice_hints(include_grok_custom=True)
-    assert [v["id"] for v in hints["grok"]["voices"]] == [
-        "ara", "eve", "rex", "sal", "leo",
-    ]
+    monkeypatch.setattr("textinator.backends.grok.discover_voices", boom)
+    status = grok_voice_status("oauth")
+    assert status == {
+        "available": False,
+        "default": "eve",
+        "voices": [],
+        "detail": "Grok unavailable: xAI OAuth is not configured",
+    }
+
+
+def test_grok_voice_endpoint_checks_selected_auth(server, monkeypatch):
+    import json
+
+    port, _app, _token = server
+    seen = []
+
+    def status(auth_mode):
+        seen.append(auth_mode)
+        return {
+            "available": True,
+            "default": "eve",
+            "voices": [{"id": "orion", "label": "Orion"}],
+            "detail": "Grok available · 1 voice",
+        }
+
+    monkeypatch.setattr("textinator.webui.grok_voice_status", status)
+    response, body = _request(port, "GET", "/grok/voices?auth=api")
+    assert response == 200
+    assert json.loads(body)["voices"] == [{"id": "orion", "label": "Orion"}]
+    assert seen == ["api"]
+
+
+def test_unavailable_grok_submission_is_rejected(server, monkeypatch):
+    port, app, _token = server
+    seen = []
+
+    def status(auth_mode):
+        seen.append(auth_mode)
+        return {
+            "available": False,
+            "default": "eve",
+            "voices": [],
+            "detail": "Grok unavailable: XAI_API_KEY is not set",
+        }
+
+    monkeypatch.setattr("textinator.webui.grok_voice_status", status)
+    response, body = _request(
+        port,
+        "POST",
+        "/make",
+        body={
+            "text": "Do not queue this.",
+            "backend": "grok",
+            "xai_auth": "api",
+        },
+    )
+    assert response == 503
+    assert b"Grok unavailable: XAI_API_KEY is not set" in body
+    assert seen == ["api"]
+    with app.lock:
+        assert app.jobs == []
 
 
 def test_post_text_creates_episode(server):

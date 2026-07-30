@@ -110,12 +110,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _cmd_list_voices(backend_name: str, prefix: str) -> int:
+def _cmd_list_voices(
+    backend_name: str,
+    prefix: str,
+    xai_auth: str | None = None,
+    allow_api_fallback: bool = False,
+) -> int:
     if backend_name == "edge":
         from .backends.edge import EdgeBackend
 
         for voice in EdgeBackend.list_voices(prefix or None):
             print(f"{voice['ShortName']:40s} {voice['Gender']:8s} {voice['Locale']}")
+        return 0
+    if backend_name == "grok":
+        from .backends.grok import GrokError, discover_voices
+
+        try:
+            voices, warning = discover_voices(
+                xai_auth,
+                allow_api_fallback=allow_api_fallback,
+            )
+        except GrokError as exc:
+            print(f"error: Grok unavailable: {exc}", file=sys.stderr)
+            return 4
+        query = prefix.casefold()
+        for voice in voices:
+            voice_id = str(voice["voice_id"])
+            name = str(voice.get("name") or voice_id)
+            if query and query not in voice_id.casefold() and query not in name.casefold():
+                continue
+            kind = "custom" if voice.get("custom") else "built-in"
+            print(f"{voice_id:24s} {name} ({kind})")
+        if warning:
+            print(f"warning: {warning}", file=sys.stderr)
         return 0
     backend = get_backend(backend_name)
     print(f"default voice for {backend_name}: {backend.default_voice}")
@@ -225,7 +252,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.list_voices is not None:
-        return _cmd_list_voices(args.backend, args.list_voices)
+        return _cmd_list_voices(
+            args.backend,
+            args.list_voices,
+            xai_auth=args.xai_auth,
+            allow_api_fallback=args.api_fallback,
+        )
 
     if args.source is None and sys.stdin.isatty():
         print(

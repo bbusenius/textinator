@@ -20,10 +20,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from .backends import AVAILABLE_BACKENDS, get_backend
-from .backends.grok import VOICES as GROK_VOICES
 from .backends.kokoro import KNOWN_VOICES as KOKORO_VOICES
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # protect the little server
@@ -88,39 +87,58 @@ _EDGE_SAMPLE_VOICES = (
 )
 
 
-def build_voice_hints(include_grok_custom: bool = False) -> dict:
-    """Voice suggestions per backend as {id, label} entries.
+def build_voice_hints() -> dict:
+    """Static hints for backends whose local catalogs are known.
 
-    With ``include_grok_custom``, the team's cloned voices are fetched from
-    the xAI API (free metadata call) and listed by name — best-effort: no
-    key or no network just means they don't appear.
+    Grok intentionally starts empty. Its built-in and custom voices are
+    discovered live for the explicitly selected xAI authentication mode.
     """
 
     def plain(voices):
         return [{"id": v, "label": v} for v in voices]
 
-    hints = {
+    return {
         "edge": {"default": "en-US-GuyNeural", "voices": plain(_EDGE_SAMPLE_VOICES)},
         "kokoro": {"default": "af_heart", "voices": plain(KOKORO_VOICES)},
-        "grok": {"default": "eve", "voices": plain(GROK_VOICES)},
+        "grok": {"default": "eve", "voices": []},
     }
-    if include_grok_custom:
-        try:
-            from .backends.grok import list_custom_voices
 
-            custom = [
-                {
-                    "id": v["voice_id"],
-                    "label": f"{v.get('name') or v['voice_id']} (custom)",
-                }
-                for v in list_custom_voices()
-                if v.get("voice_id")
-            ]
-            # cloned voices first — if you made one, it's the one you want
-            hints["grok"]["voices"] = custom + hints["grok"]["voices"]
-        except Exception:
-            pass  # decoration only; the form works without it
-    return hints
+
+def grok_voice_status(auth_mode: str) -> dict:
+    """Return a secret-free, live Grok availability and voice catalog."""
+    from .backends.grok import GrokError, discover_voices
+
+    try:
+        voices, warning = discover_voices(auth_mode)
+    except GrokError as exc:
+        return {
+            "available": False,
+            "default": "eve",
+            "voices": [],
+            "detail": f"Grok unavailable: {exc}",
+        }
+
+    hints = []
+    for voice in voices:
+        voice_id = str(voice["voice_id"])
+        name = str(voice.get("name") or "").strip()
+        if voice.get("custom"):
+            label = f"{name or voice_id} (custom)"
+        elif name and name.casefold() != voice_id.casefold():
+            label = f"{name} ({voice_id})"
+        else:
+            label = name or voice_id
+        hints.append({"id": voice_id, "label": label})
+
+    detail = f"Grok available · {len(hints)} voice{'s' if len(hints) != 1 else ''}"
+    if warning:
+        detail += f" · {warning}"
+    return {
+        "available": True,
+        "default": "eve",
+        "voices": hints,
+        "detail": detail,
+    }
 
 _MIME = {
     ".xml": "application/rss+xml; charset=utf-8",
@@ -261,11 +279,13 @@ _PAGE = """<!DOCTYPE html>
    <option value="oauth">OAuth · subscription</option>
    <option value="api">API key · metered</option>
   </select>
+  <p><small id="grok-status" role="status"></small>
+  <button type="button" id="retry-grok">Retry Grok</button></p>
  </div>
  <label>Voice (optional, backend default if blank)</label>
  <input type="text" name="voice" list="voice-options" autocomplete="off">
  <datalist id="voice-options"></datalist>
- <button type="submit">Make episode</button>
+ <button type="submit" id="make-episode">Make episode</button>
  <button type="button" id="clear-form">Clear</button>
  <small>fields are kept after submitting, so you can retry with another
  voice or backend — Clear empties them</small>
@@ -290,23 +310,88 @@ _PAGE = """<!DOCTYPE html>
   var xaiAuth = document.querySelector('select[name=xai_auth]');
   var voiceInput = document.querySelector('input[name=voice]');
   var voiceList = document.getElementById('voice-options');
+  var makeButton = document.getElementById('make-episode');
+  var grokStatus = document.getElementById('grok-status');
+  var retryGrok = document.getElementById('retry-grok');
   var HINTS = {voice_hints};
+  var grokRequest = 0;
 
   // voice placeholder + suggestions follow the selected backend
-  function updateVoiceHints() {{
-    var hint = HINTS[select.value];
-    if (!hint) {{ voiceInput.placeholder = ''; voiceList.innerHTML = ''; return; }}
-    voiceInput.placeholder =
-      'default: ' + hint['default'] + ' — e.g. ' +
-      hint.voices.slice(0, 3).map(function (v) {{ return v.label; }}).join(', ');
+  function renderVoiceHints(hint) {{
     voiceList.innerHTML = '';
+    if (!hint) {{ voiceInput.placeholder = ''; return; }}
+    var examples = hint.voices.slice(0, 3)
+      .map(function (v) {{ return v.label; }}).join(', ');
+    voiceInput.placeholder = 'default: ' + hint['default'] +
+      (examples ? ' — e.g. ' + examples : '');
     hint.voices.forEach(function (v) {{
       var option = document.createElement('option');
       option.value = v.id;          // what gets submitted
       option.textContent = v.label; // what the dropdown displays
       voiceList.appendChild(option);
     }});
-    xaiAuthFields.style.display = select.value === 'grok' ? '' : 'none';
+  }}
+
+  function setGrokUnavailable(detail) {{
+    renderVoiceHints(null);
+    voiceInput.placeholder = 'Grok unavailable';
+    voiceInput.disabled = true;
+    makeButton.disabled = true;
+    grokStatus.className = 'failed';
+    grokStatus.textContent = detail;
+    retryGrok.style.display = '';
+  }}
+
+  function loadGrokVoices() {{
+    var request = ++grokRequest;
+    renderVoiceHints(null);
+    voiceInput.placeholder = 'Checking Grok availability…';
+    voiceInput.disabled = true;
+    makeButton.disabled = true;
+    grokStatus.className = 'running';
+    grokStatus.textContent = 'Checking Grok availability…';
+    retryGrok.style.display = 'none';
+    fetch('/grok/voices?auth=' + encodeURIComponent(xaiAuth.value))
+      .then(function (response) {{
+        return response.json().then(function (data) {{
+          if (!response.ok) throw new Error(data.detail || 'availability check failed');
+          return data;
+        }});
+      }})
+      .then(function (status) {{
+        if (request !== grokRequest || select.value !== 'grok') return;
+        if (!status.available) {{
+          setGrokUnavailable(status.detail || 'Grok unavailable');
+          return;
+        }}
+        HINTS.grok = status;
+        renderVoiceHints(status);
+        voiceInput.disabled = false;
+        makeButton.disabled = false;
+        grokStatus.className =
+          status.detail.indexOf('custom voices unavailable:') >= 0 ? 'running' : 'done';
+        grokStatus.textContent = status.detail;
+        retryGrok.style.display = '';
+      }})
+      .catch(function (error) {{
+        if (request !== grokRequest || select.value !== 'grok') return;
+        setGrokUnavailable('Grok unavailable: ' + error.message);
+      }});
+  }}
+
+  function updateVoiceHints() {{
+    var isGrok = select.value === 'grok';
+    xaiAuthFields.style.display = isGrok ? '' : 'none';
+    if (isGrok) {{
+      loadGrokVoices();
+      return;
+    }}
+    ++grokRequest; // make any in-flight Grok result stale
+    grokStatus.textContent = '';
+    retryGrok.style.display = 'none';
+    voiceInput.disabled = false;
+    makeButton.disabled = false;
+    renderVoiceHints(HINTS[select.value]);
   }}
 
   // remember the last-chosen backend on this device
@@ -347,6 +432,8 @@ _PAGE = """<!DOCTYPE html>
   }});
 
   select.addEventListener('change', updateVoiceHints);
+  xaiAuth.addEventListener('change', updateVoiceHints);
+  retryGrok.addEventListener('click', loadGrokVoices);
   updateVoiceHints();
 
   // datalist quirk: browsers filter suggestions by the field's current value,
@@ -432,7 +519,8 @@ def _make_handler(app: _App):
 
         # ---- routes ------------------------------------------------------
         def do_GET(self):
-            path = unquote(urlparse(self.path).path)
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
             token = Feed.load(app.feed_dir).token
             if token and path.startswith(f"/{token}/"):
                 return self._serve_feed_file(path.removeprefix(f"/{token}/"))
@@ -442,6 +530,14 @@ def _make_handler(app: _App):
                 return self._send_jobs()
             if path == "/episodes":
                 return self._send_json(_episode_entries(app))
+            if path == "/grok/voices":
+                auth_mode = parse_qs(parsed.query).get("auth", ["oauth"])[0]
+                if auth_mode not in {"oauth", "api"}:
+                    return self._send_json(
+                        {"available": False, "detail": "invalid xAI auth mode"},
+                        status=400,
+                    )
+                return self._send_json(grok_voice_status(auth_mode))
             self.send_error(404)
 
         def _send_jobs(self):
@@ -451,11 +547,11 @@ def _make_handler(app: _App):
                 jobs = [asdict(j) for j in app.jobs]
             self._send_json(jobs)
 
-        def _send_json(self, payload):
+        def _send_json(self, payload, status: int = 200):
             import json
 
             body = json.dumps(payload).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -483,10 +579,30 @@ def _make_handler(app: _App):
             )
             text = (forms.get("text") or "").strip()
             url = (forms.get("url") or "").strip()
+            backend_name = (forms.get("backend") or "edge").strip()
+            xai_auth = (forms.get("xai_auth") or "oauth").strip()
+            part = files.get("file")
+            if not text and not url and not (part is not None and part.filename):
+                return self._send_html("<p>nothing to read — go back.</p>", 400)
+            if backend_name not in AVAILABLE_BACKENDS:
+                return self._send_html("<p>unknown backend — go back.</p>", 400)
+            if backend_name == "grok":
+                if xai_auth not in {"oauth", "api"}:
+                    return self._send_html(
+                        "<p>invalid xAI auth mode — go back.</p>",
+                        400,
+                    )
+                status = grok_voice_status(xai_auth)
+                if not status["available"]:
+                    detail = html.escape(status["detail"])
+                    return self._send_html(
+                        f"<p>{detail}</p><p>Go back and retry or choose "
+                        "another backend.</p>",
+                        503,
+                    )
 
             upload_path = None
             upload_name = ""
-            part = files.get("file")
             if part is not None and part.filename:
                 suffix = Path(part.filename).suffix.lower() or ".txt"
                 handle = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
@@ -496,12 +612,10 @@ def _make_handler(app: _App):
                 upload_path = Path(handle.name)
                 upload_name = part.filename
 
-            if not text and not url and upload_path is None:
-                return self._send_html("<p>nothing to read — go back.</p>", 400)
             app.start_job(
                 source=url or text,
-                backend_name=forms.get("backend") or "edge",
-                xai_auth=(forms.get("xai_auth") or "oauth").strip(),
+                backend_name=backend_name,
+                xai_auth=xai_auth,
                 voice=(forms.get("voice") or "").strip(),
                 title=(forms.get("title") or "").strip(),
                 upload_path=upload_path,
@@ -603,9 +717,6 @@ def run_server(
         feed_dir=feed_dir,
         base_url=base_url,
         page_url=f"http://{ui_host}:{port}/",
-        # pick up cloned grok voices (by name) for the dropdown; new clones
-        # appear after a server restart
-        voice_hints=build_voice_hints(include_grok_custom=True),
     )
     server = ThreadingHTTPServer((host, port), _make_handler(app))
     print(f"textinator web UI: http://{ui_host}:{port}/")
